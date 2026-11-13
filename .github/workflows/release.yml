@@ -14,8 +14,34 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validate:
+    name: 校验版本
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: 校验标签
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            echo "发布必须在 tag 上触发, 请选择 v* 标签运行" >&2
+            exit 1
+          fi
+
+          version="${GITHUB_REF_NAME}"
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "标签格式不正确: $version" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
   build:
     name: 构建 (${{ matrix.name }})
+    needs: validate
     strategy:
       fail-fast: false
       matrix:
@@ -70,32 +96,16 @@ jobs:
 
   release:
     name: 创建发布
-    needs: build
+    needs: [validate, build]
     runs-on: ubuntu-latest
+    env:
+      GITHUB_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.validate.outputs.version }}
     steps:
       - name: 检出代码
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: 读取版本并校验
-        id: version
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
-            echo "发布必须在 tag 上触发, 请选择 v* 标签运行" >&2
-            exit 1
-          fi
-
-          version="${GITHUB_REF_NAME}"
-          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
-            echo "标签格式不正确: $version" >&2
-            exit 1
-          fi
-
-          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: 下载产物
         uses: actions/download-artifact@v4
@@ -112,12 +122,10 @@ jobs:
 
       - name: 生成发布内容
         shell: bash
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
 
-          previous_tag=$(git describe --tags --abbrev=0 "$VERSION^" 2>/dev/null || true)
+          previous_tag=$(git describe --tags --abbrev=0 --match 'v[0-9]*' "$VERSION^" 2>/dev/null || true)
 
           {
             echo "<details><summary>变更内容</summary>"
@@ -138,34 +146,39 @@ jobs:
           fi
 
       - name: 创建或更新发布
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
         shell: bash
         run: |
           set -euo pipefail
 
           # 0.x 版本按预发布处理
-          pre_flag=""
+          flags=()
           if [[ "$VERSION" == v0.* ]]; then
-            pre_flag="--prerelease"
+            flags+=(--prerelease)
           fi
 
           if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            # 更新时保留已人工修订的发布说明
             gh release edit "$VERSION" \
               --repo "$GITHUB_REPOSITORY" \
               --title "$VERSION" \
-              --notes-file release-notes.md \
               --draft=false \
-              $pre_flag
+              "${flags[@]}"
           else
             gh release create "$VERSION" \
               --repo "$GITHUB_REPOSITORY" \
               --title "$VERSION" \
               --notes-file release-notes.md \
               --verify-tag \
-              $pre_flag
+              "${flags[@]}"
           fi
+
+          # 清理不存在于本次产物的旧资产
+          while read -r asset; do
+            [[ -n "$asset" ]] || continue
+            if [[ "$asset" == webdav-agg-* && ! -e "dist/$asset" ]]; then
+              gh release delete-asset "$VERSION" "$asset" --repo "$GITHUB_REPOSITORY" --yes
+            fi
+          done < <(gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" --json assets -q '.assets[].name')
 
           gh release upload "$VERSION" dist/webdav-agg-* dist/checksums.txt \
             --clobber --repo "$GITHUB_REPOSITORY"

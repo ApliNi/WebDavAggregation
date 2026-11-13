@@ -16,6 +16,8 @@ go build -trimpath -o webdav-agg .
 ./webdav-agg
 ```
 
+Releases 附带 `checksums.txt`, 可用 `sha256sum -c checksums.txt` 校验下载产物; macOS 若提示无法验证开发者, 执行 `xattr -d com.apple.quarantine webdav-agg`.
+
 ### 聚合机制
 
 - 读取: 合并显示所有存储的文件列表

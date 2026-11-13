@@ -1,3 +1,7 @@
 .pi-temp/
+config.yml
 webdav-agg
+*.exe
 *.db
+*.db-wal
+*.db-shm
