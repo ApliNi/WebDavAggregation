@@ -1,0 +1,37 @@
+# WebDAV 聚合服务监听地址
+# 聚合存储服务挂载于 /dav 路径, 例如 http://127.0.0.1:5245/dav
+listen: 127.0.0.1:5245
+
+# 下游客户端认证, 整块注释 (不配置) 则不启用认证
+auth:
+  user: admin
+  pass: 123456
+
+# 上游请求失败重试, 对上传请求无效
+retry: 3
+
+# 上游请求网络代理
+proxy: ''
+
+# 缓存过期时间 (默认 24h; 为 0 表示始终请求上游探测, 为负数如 -1 表示不过期)
+cache_expire: 24h
+
+# 数据库文件路径
+data_file: data.db
+
+# 上游服务列表
+upstream:
+- id: 1 # 节点唯一数字 ID (大于 0 且不可重复)
+  url: http://127.0.0.1:5243
+  user: admin
+  pass: 12345
+  # capacity 支持以下两种模式:
+  # 1. 物理容量限额模式: 如 2T, 200G, 100M (超出限额时返回 507 Insufficient Storage)
+  # 2. 比例权重模式: 如 1.00, 2.00 (无物理容量上限, 多节点根据当前已用量与权重比例均衡写入)
+  capacity: 2T
+
+- id: 2
+  url: http://127.0.0.1:5244
+  user: admin
+  pass: 12345
+  capacity: 2T
