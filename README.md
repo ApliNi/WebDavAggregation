@@ -2,6 +2,20 @@
 
 将多个 WebDav 存储聚合为一个, 推荐配合 OpenList 使用.
 
+## 使用
+
+从 [Releases](https://github.com/ApliNi/WebDavAggregation/releases) 下载对应平台的二进制文件.
+
+或构建二进制文件:
+```bash
+go build -trimpath -o webdav-agg .
+```
+
+将 [config.example.yml](config.example.yml) 复制为 `config.yml` 并按需修改, 同目录启动即可:
+```bash
+./webdav-agg
+```
+
 ### 聚合机制
 
 - 读取: 合并显示所有存储的文件列表

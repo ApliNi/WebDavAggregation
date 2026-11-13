@@ -1,0 +1,171 @@
+name: 发布
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: 构建 (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux-amd64
+            goos: linux
+            goarch: amd64
+            suffix: ""
+          - name: linux-arm64
+            goos: linux
+            goarch: arm64
+            suffix: ""
+          - name: windows-amd64
+            goos: windows
+            goarch: amd64
+            suffix: ".exe"
+          - name: macos-arm64
+            goos: darwin
+            goarch: arm64
+            suffix: ""
+          - name: macos-amd64
+            goos: darwin
+            goarch: amd64
+            suffix: ""
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Go 工具链
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: 构建
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          set -euo pipefail
+          go build -trimpath -buildvcs=false -ldflags="-s -w" -o "dist/webdav-agg-${{ matrix.name }}${{ matrix.suffix }}" .
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: dist/webdav-agg-${{ matrix.name }}${{ matrix.suffix }}
+          if-no-files-found: error
+
+  release:
+    name: 创建发布
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 读取版本并校验
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_REF_TYPE}" != "tag" ]]; then
+            echo "发布必须在 tag 上触发, 请选择 v* 标签运行" >&2
+            exit 1
+          fi
+
+          version="${GITHUB_REF_NAME}"
+          if [[ ! "$version" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "标签格式不正确: $version" >&2
+            exit 1
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: 下载产物
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 生成校验和
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum webdav-agg-* > checksums.txt
+
+      - name: 生成发布内容
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+
+          previous_tag=$(git describe --tags --abbrev=0 "$VERSION^" 2>/dev/null || true)
+
+          {
+            echo "<details><summary>变更内容</summary>"
+            echo
+            if [[ -n "$previous_tag" ]]; then
+              git log --pretty=format:'- %s (%h)' "$previous_tag..$VERSION"
+            else
+              git log --pretty=format:'- %s (%h)' "$VERSION"
+            fi
+            echo
+            echo
+            echo "</details>"
+          } > release-notes.md
+
+          if [[ ! -s release-notes.md ]]; then
+            echo "生成发布内容失败" >&2
+            exit 1
+          fi
+
+      - name: 创建或更新发布
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # 0.x 版本按预发布处理
+          pre_flag=""
+          if [[ "$VERSION" == v0.* ]]; then
+            pre_flag="--prerelease"
+          fi
+
+          if gh release view "$VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release edit "$VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$VERSION" \
+              --notes-file release-notes.md \
+              --draft=false \
+              $pre_flag
+          else
+            gh release create "$VERSION" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$VERSION" \
+              --notes-file release-notes.md \
+              --verify-tag \
+              $pre_flag
+          fi
+
+          gh release upload "$VERSION" dist/webdav-agg-* dist/checksums.txt \
+            --clobber --repo "$GITHUB_REPOSITORY"
