@@ -52,23 +52,6 @@ func (s *Server) resolveDestinationPath(srcPath, destURLPath string) string {
 	return destClean
 }
 
-type countingReader struct {
-	reader io.Reader
-	n      int64
-}
-
-func (c *countingReader) Read(p []byte) (int, error) {
-	n, err := c.reader.Read(p)
-	c.n += int64(n)
-	return n, err
-}
-
-func (c *countingReader) Close() error {
-	if rc, ok := c.reader.(io.Closer); ok {
-		return rc.Close()
-	}
-	return nil
-}
 func isValidContentRange(cr string) bool {
 	cr = strings.TrimSpace(cr)
 	if !strings.HasPrefix(cr, "bytes ") {
@@ -870,7 +853,13 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 	}
 	defer rollback()
 
-	cr := &countingReader{reader: r.Body}
+	var cr *countingReadCloser
+	if existing, ok := r.Body.(*countingReadCloser); ok {
+		cr = existing
+	} else {
+		cr = newCountingReadCloser(r.Body)
+		r.Body = cr
+	}
 	err = targetNode.Client.Put(r.Context(), davPath, cr, r.ContentLength, r.Header.Get("Content-Type"))
 	if err != nil {
 		rollback()
@@ -883,7 +872,7 @@ func (s *Server) handlePut(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	written := cr.n
+	written := cr.BytesRead()
 	if written == 0 && r.ContentLength > 0 {
 		written = r.ContentLength
 	}

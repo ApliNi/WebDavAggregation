@@ -2206,6 +2206,57 @@ func TestLoggingResponseWriter(t *testing.T) {
 			t.Errorf("bytesWritten = %d, want 11", lrw.bytesWritten)
 		}
 	})
+
+	t.Run("unwrap returns underlying ResponseWriter", func(t *testing.T) {
+		rec := httptest.NewRecorder()
+		lrw := &loggingResponseWriter{ResponseWriter: rec, statusCode: http.StatusOK}
+		if lrw.Unwrap() != rec {
+			t.Errorf("Unwrap() = %v, want %v", lrw.Unwrap(), rec)
+		}
+	})
+}
+
+func TestCountingReadCloser(t *testing.T) {
+	t.Run("read and close tracking", func(t *testing.T) {
+		rc := io.NopCloser(bytes.NewReader([]byte("test data 12345")))
+		crc := newCountingReadCloser(rc)
+		if crc.Unwrap() != rc {
+			t.Errorf("Unwrap() = %v, want %v", crc.Unwrap(), rc)
+		}
+
+		buf := make([]byte, 4)
+		n, err := crc.Read(buf)
+		if err != nil || n != 4 {
+			t.Fatalf("Read n = %d, err = %v", n, err)
+		}
+		if crc.BytesRead() != 4 {
+			t.Errorf("BytesRead = %d, want 4", crc.BytesRead())
+		}
+
+		rest, err := io.ReadAll(crc)
+		if err != nil {
+			t.Fatalf("ReadAll error: %v", err)
+		}
+		if len(rest) != 11 {
+			t.Fatalf("ReadAll len = %d, want 11", len(rest))
+		}
+		if crc.BytesRead() != 15 {
+			t.Errorf("BytesRead = %d, want 15", crc.BytesRead())
+		}
+		_ = crc.Close()
+	})
+
+	t.Run("nil reader falls back to http.NoBody", func(t *testing.T) {
+		crc := newCountingReadCloser(nil)
+		buf := make([]byte, 10)
+		n, err := crc.Read(buf)
+		if err != io.EOF || n != 0 {
+			t.Errorf("Read = (%d, %v), want (0, EOF)", n, err)
+		}
+		if crc.BytesRead() != 0 {
+			t.Errorf("BytesRead = %d, want 0", crc.BytesRead())
+		}
+	})
 }
 
 func TestHTTPLogFormatting_EndToEnd(t *testing.T) {
@@ -2251,6 +2302,139 @@ func TestHTTPLogFormatting_EndToEnd(t *testing.T) {
 	matched, err = regexp.MatchString(pattern404, logs404)
 	if err != nil || !matched {
 		t.Errorf("expected 404 log matching %q, got:\n%s", pattern404, logs404)
+	}
+
+	// 3. Successful PUT upload creating a new file -> logs upload size
+	putPayload := []byte("hello webdav upload 12345") // 25 bytes
+	logsPut := captureLogs(t, func() {
+		req := httptest.NewRequest("PUT", "/dav/uploaded.txt", bytes.NewReader(putPayload))
+		req.Header.Set("X-Forwarded-For", "198.51.100.1")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("PUT expected 201 Created, got %d", rec.Code)
+		}
+	})
+
+	putPattern := `\[\d{2}:\d{2}:\d{2} INFO\]: \[HTTP\] PUT 201 "/dav/uploaded\.txt" \d+\.\d{2}s 25\.00B - 198\.51\.100\.1`
+	matched, err = regexp.MatchString(putPattern, logsPut)
+	if err != nil || !matched {
+		t.Errorf("expected PUT log matching %q, got:\n%s", putPattern, logsPut)
+	}
+
+	// 4. Successful PUT overwrite -> logs upload size and 204
+	logsPutOverwrite := captureLogs(t, func() {
+		overwritePayload := []byte("new overwritten data") // 20 bytes
+		req := httptest.NewRequest("PUT", "/dav/uploaded.txt", bytes.NewReader(overwritePayload))
+		req.Header.Set("X-Forwarded-For", "198.51.100.1")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("PUT overwrite expected 204 No Content, got %d", rec.Code)
+		}
+	})
+
+	putOverwritePattern := `\[\d{2}:\d{2}:\d{2} INFO\]: \[HTTP\] PUT 204 "/dav/uploaded\.txt" \d+\.\d{2}s 20\.00B - 198\.51\.100\.1`
+	matched, err = regexp.MatchString(putOverwritePattern, logsPutOverwrite)
+	if err != nil || !matched {
+		t.Errorf("expected PUT overwrite log matching %q, got:\n%s", putOverwritePattern, logsPutOverwrite)
+	}
+
+	// 5. Successful PUT empty file -> logs 0.00B
+	logsPutEmpty := captureLogs(t, func() {
+		req := httptest.NewRequest("PUT", "/dav/empty.txt", bytes.NewReader([]byte{}))
+		req.Header.Set("X-Forwarded-For", "198.51.100.2")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("PUT empty expected 201 Created, got %d", rec.Code)
+		}
+	})
+
+	putEmptyPattern := `\[\d{2}:\d{2}:\d{2} INFO\]: \[HTTP\] PUT 201 "/dav/empty\.txt" \d+\.\d{2}s 0\.00B - 198\.51\.100\.2`
+	matched, err = regexp.MatchString(putEmptyPattern, logsPutEmpty)
+	if err != nil || !matched {
+		t.Errorf("expected PUT empty log matching %q, got:\n%s", putEmptyPattern, logsPutEmpty)
+	}
+
+	// 6. PROPFIND returning directory XML -> logs response XML size
+	logsPropfind := captureLogs(t, func() {
+		req := httptest.NewRequest("PROPFIND", "/dav/", nil)
+		req.Header.Set("Depth", "1")
+		req.Header.Set("X-Forwarded-For", "198.51.100.3")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusMultiStatus {
+			t.Fatalf("PROPFIND expected 207 MultiStatus, got %d", rec.Code)
+		}
+	})
+
+	propfindPattern := `\[\d{2}:\d{2}:\d{2} INFO\]: \[HTTP\] PROPFIND 207 "/dav/" \d+\.\d{2}s [1-9]\d*(\.\d{2})?[KMG]?B - 198\.51\.100\.3`
+	matched, err = regexp.MatchString(propfindPattern, logsPropfind)
+	if err != nil || !matched {
+		t.Errorf("expected PROPFIND log matching %q, got:\n%s", propfindPattern, logsPropfind)
+	}
+
+	// 7. HEAD request -> logs 0.00B
+	logsHead := captureLogs(t, func() {
+		req := httptest.NewRequest("HEAD", "/dav/test.txt", nil)
+		req.Header.Set("X-Forwarded-For", "198.51.100.4")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("HEAD expected 200 OK, got %d", rec.Code)
+		}
+	})
+
+	headPattern := `\[\d{2}:\d{2}:\d{2} INFO\]: \[HTTP\] HEAD 200 "/dav/test\.txt" \d+\.\d{2}s 0\.00B - 198\.51\.100\.4`
+	matched, err = regexp.MatchString(headPattern, logsHead)
+	if err != nil || !matched {
+		t.Errorf("expected HEAD log matching %q, got:\n%s", headPattern, logsHead)
+	}
+
+	// 8. DELETE request -> logs 0.00B
+	logsDelete := captureLogs(t, func() {
+		req := httptest.NewRequest("DELETE", "/dav/uploaded.txt", nil)
+		req.Header.Set("X-Forwarded-For", "198.51.100.5")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("DELETE expected 204 No Content, got %d", rec.Code)
+		}
+	})
+
+	deletePattern := `\[\d{2}:\d{2}:\d{2} INFO\]: \[HTTP\] DELETE 204 "/dav/uploaded\.txt" \d+\.\d{2}s 0\.00B - 198\.51\.100\.5`
+	matched, err = regexp.MatchString(deletePattern, logsDelete)
+	if err != nil || !matched {
+		t.Errorf("expected DELETE log matching %q, got:\n%s", deletePattern, logsDelete)
+	}
+
+	// 9. Auth enabled server: failed auth logs 0.00B
+	cfgAuth := &config.Config{
+		Listen: "127.0.0.1:0",
+		Auth: config.AuthConfig{
+			User: "admin",
+			Pass: "secret",
+		},
+		Upstream: []config.UpstreamConfig{
+			{ID: 1, URL: up.server.URL},
+		},
+	}
+	srvAuth := newTestServer(t, cfgAuth)
+	logsAuthFail := captureLogs(t, func() {
+		req := httptest.NewRequest("PUT", "/dav/secret.bin", strings.NewReader("some unauthenticated payload"))
+		req.Header.Set("X-Real-IP", "192.0.2.99")
+		rec := httptest.NewRecorder()
+		srvAuth.Handler().ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized, got %d", rec.Code)
+		}
+	})
+
+	authPattern := `\[\d{2}:\d{2}:\d{2} INFO\]: \[HTTP\] PUT 401 "/dav/secret\.bin" \d+\.\d{2}s 0\.00B - 192\.0\.2\.99`
+	matched, err = regexp.MatchString(authPattern, logsAuthFail)
+	if err != nil || !matched {
+		t.Errorf("expected auth 401 log matching %q, got:\n%s", authPattern, logsAuthFail)
 	}
 }
 

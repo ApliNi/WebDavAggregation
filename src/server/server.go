@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"webdav-agg/src/cluster"
@@ -118,6 +119,41 @@ func (w *loggingResponseWriter) Flush() {
 		f.Flush()
 	}
 }
+
+func (w *loggingResponseWriter) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
+type countingReadCloser struct {
+	reader    io.ReadCloser
+	bytesRead atomic.Int64
+}
+
+func newCountingReadCloser(rc io.ReadCloser) *countingReadCloser {
+	if rc == nil {
+		rc = http.NoBody
+	}
+	return &countingReadCloser{reader: rc}
+}
+
+func (c *countingReadCloser) Read(p []byte) (int, error) {
+	n, err := c.reader.Read(p)
+	c.bytesRead.Add(int64(n))
+	return n, err
+}
+
+func (c *countingReadCloser) Close() error {
+	return c.reader.Close()
+}
+
+func (c *countingReadCloser) BytesRead() int64 {
+	return c.bytesRead.Load()
+}
+
+func (c *countingReadCloser) Unwrap() io.Reader {
+	return c.reader
+}
+
 var copyBufPool = sync.Pool{
 	New: func() any {
 		b := make([]byte, 32*1024)
@@ -206,10 +242,17 @@ func (s *Server) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		lrw := &loggingResponseWriter{ResponseWriter: w, statusCode: http.StatusOK}
+		bodyTracker := newCountingReadCloser(r.Body)
+		r.Body = bodyTracker
 
 		defer func() {
 			duration := time.Since(start)
-			logger.Info("HTTP", "%s %d %q %s %s - %s", r.Method, lrw.statusCode, r.URL.Path, formatDuration(duration), formatBytes(lrw.bytesWritten), getClientIP(r))
+			bytesRead := bodyTracker.BytesRead()
+			if bytesRead == 0 && r.ContentLength > 0 && (r.Method == "PUT" || r.Method == "POST" || r.Method == "PROPPATCH" || r.Method == "LOCK") && (lrw.statusCode >= 200 && lrw.statusCode < 300) {
+				bytesRead = r.ContentLength
+			}
+			totalBytes := lrw.bytesWritten + bytesRead
+			logger.Info("HTTP", "%s %d %q %s %s - %s", r.Method, lrw.statusCode, r.URL.Path, formatDuration(duration), formatBytes(totalBytes), getClientIP(r))
 		}()
 
 		// WebDAV service is mounted at /dav.
