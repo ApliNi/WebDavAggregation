@@ -215,3 +215,146 @@ func TestServer_MoveWithDuplicateSourceInstances_NoDeadlock(t *testing.T) {
 		t.Fatalf("expected newer content %q, got %q", "new_content", string(content))
 	}
 }
+
+func TestServer_ConcurrentWorkerPoolAndHierarchicalDirectoryDelete(t *testing.T) {
+	up := newTestWebDAVUpstream(500000, 100, true)
+	defer up.Close()
+
+	// Strict handler that rejects DELETE on non-empty directories (simulating strict cloud backends)
+	strictHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			davPath := r.URL.Path
+			if !strings.HasPrefix(davPath, "/") {
+				davPath = "/" + davPath
+			}
+			up.mu.Lock()
+			hasChildren := false
+			prefix := strings.TrimSuffix(davPath, "/") + "/"
+			for k := range up.resources {
+				if strings.HasPrefix(k, prefix) {
+					hasChildren = true
+					break
+				}
+			}
+			up.mu.Unlock()
+			if hasChildren {
+				http.Error(w, "Directory not empty", http.StatusInternalServerError)
+				return
+			}
+		}
+		up.server.Config.Handler.ServeHTTP(w, r)
+	})
+	strictServer := httptest.NewServer(strictHandler)
+	defer strictServer.Close()
+
+	cfg := &config.Config{
+		Listen: "127.0.0.1:0",
+		Upstream: []config.UpstreamConfig{
+			{ID: 1, URL: strictServer.URL, Capacity: "100M"},
+		},
+	}
+	srv := newTestServer(t, cfg)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	c, err := client.NewClient(ts.URL+"/dav", "", "", "", 1, 5*time.Second)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// Populate directory structure with multiple levels and many files
+	const topFiles = 25
+	for i := range topFiles {
+		fPath := fmt.Sprintf("/batch_del/top_file_%d.txt", i)
+		if err := c.Put(context.Background(), fPath, strings.NewReader("data"), 4, "text/plain"); err != nil {
+			t.Fatalf("Put %s failed: %v", fPath, err)
+		}
+	}
+
+	for sub := range 3 {
+		for i := range 5 {
+			fPath := fmt.Sprintf("/batch_del/sub_%d/sub_file_%d.txt", sub, i)
+			if err := c.Put(context.Background(), fPath, strings.NewReader("subdata"), 7, "text/plain"); err != nil {
+				t.Fatalf("Put %s failed: %v", fPath, err)
+			}
+			deepPath := fmt.Sprintf("/batch_del/sub_%d/deep/deep_file_%d.txt", sub, i)
+			if err := c.Put(context.Background(), deepPath, strings.NewReader("deepdata"), 8, "text/plain"); err != nil {
+				t.Fatalf("Put %s failed: %v", deepPath, err)
+			}
+		}
+	}
+
+	// Delete root collection /batch_del
+	if err := c.Delete(context.Background(), "/batch_del"); err != nil {
+		t.Fatalf("Delete /batch_del failed: %v", err)
+	}
+
+	// Verify PROPFIND on /batch_del returns 404
+	_, err = c.Stat(context.Background(), "/batch_del")
+	if err == nil {
+		t.Fatalf("expected 404 for /batch_del after deletion, but stat succeeded")
+	}
+
+	// Verify physical upstream is completely clean
+	up.mu.Lock()
+	defer up.mu.Unlock()
+	for p := range up.resources {
+		if strings.HasPrefix(p, "/batch_del") {
+			t.Errorf("orphan resource %s still exists on upstream", p)
+		}
+	}
+}
+
+func TestServer_FastDirectDeleteAttempt(t *testing.T) {
+	up := newTestWebDAVUpstream(500000, 100, true)
+	defer up.Close()
+
+	cfg := &config.Config{
+		Listen: "127.0.0.1:0",
+		Upstream: []config.UpstreamConfig{
+			{ID: 1, URL: up.server.URL, Capacity: "100M"},
+		},
+	}
+	srv := newTestServer(t, cfg)
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+
+	c, err := client.NewClient(ts.URL+"/dav", "", "", "", 1, 5*time.Second)
+	if err != nil {
+		t.Fatalf("NewClient failed: %v", err)
+	}
+
+	// Upload 20 files
+	for i := range 20 {
+		fPath := fmt.Sprintf("/fast_del/file_%d.txt", i)
+		if err := c.Put(context.Background(), fPath, strings.NewReader("payload"), 7, "text/plain"); err != nil {
+			t.Fatalf("Put %s failed: %v", fPath, err)
+		}
+	}
+
+	// Record DELETE count on upstream before deleting /fast_del
+	up.mu.Lock()
+	deletesBefore := up.reqCounts["DELETE"]
+	up.mu.Unlock()
+
+	// Delete collection /fast_del
+	if err := c.Delete(context.Background(), "/fast_del"); err != nil {
+		t.Fatalf("Delete /fast_del failed: %v", err)
+	}
+
+	// Since mock upstream supports recursive DELETE, fast direct delete should have succeeded in exactly 1 DELETE request
+	up.mu.Lock()
+	deletesAfter := up.reqCounts["DELETE"]
+	up.mu.Unlock()
+
+	diff := deletesAfter - deletesBefore
+	if diff != 1 {
+		t.Errorf("expected fast direct delete in 1 DELETE request, got %d", diff)
+	}
+
+	// Verify /fast_del is gone
+	_, err = c.Stat(context.Background(), "/fast_del")
+	if err == nil {
+		t.Fatalf("expected 404 for /fast_del after deletion")
+	}
+}

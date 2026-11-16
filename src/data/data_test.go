@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -378,6 +379,7 @@ func TestPROPFINDDirectChildrenAndRouting(t *testing.T) {
 		t.Fatalf("expected 2 unique direct children under /, got %d unique (%d total): %+v", len(rootPaths), len(rootChildren), rootChildren)
 	}
 }
+
 // TestSubtreeQueryAndCalibration tests:
 // - Subtree queries
 // - Single and multi-storage quota calibrations
@@ -1634,5 +1636,89 @@ INSERT INTO files (storage_id, path, parent_path, size, is_dir) VALUES (1, '/leg
 	}
 	if !rec2.LastProbedAt.Equal(newTime) {
 		t.Fatalf("expected LastProbedAt %v, got %v", newTime, rec2.LastProbedAt)
+	}
+}
+
+func TestBTreeSubtreeOperations(t *testing.T) {
+	m, err := NewManager(":memory:")
+	if err != nil {
+		t.Fatalf("NewManager failed: %v", err)
+	}
+	defer m.Close()
+
+	if err := m.EnsureStorage(1); err != nil {
+		t.Fatalf("EnsureStorage failed: %v", err)
+	}
+
+	// Insert sibling items with boundary-sensitive names:
+	// /folder
+	// /folder.txt
+	// /folder-item
+	// /folder0
+	// /folder_other
+	records := []FileRecord{
+		{StorageID: 1, Path: "/folder", IsDir: true},
+		{StorageID: 1, Path: "/folder.txt", Size: 10, IsDir: false},
+		{StorageID: 1, Path: "/folder-item", Size: 20, IsDir: false},
+		{StorageID: 1, Path: "/folder0", Size: 30, IsDir: false},
+		{StorageID: 1, Path: "/folder_other", Size: 40, IsDir: false},
+	}
+	for i := range 100 {
+		records = append(records, FileRecord{
+			StorageID: 1,
+			Path:      fmt.Sprintf("/folder/child_%03d.dat", i),
+			Size:      100,
+			IsDir:     false,
+		})
+	}
+	if err := m.BatchInsert(records); err != nil {
+		t.Fatalf("BatchInsert failed: %v", err)
+	}
+
+	// 1. ListSubtree on /folder should return /folder plus 100 children = 101 items
+	sub, err := m.ListSubtree("/folder")
+	if err != nil {
+		t.Fatalf("ListSubtree failed: %v", err)
+	}
+	if len(sub) != 101 {
+		t.Fatalf("expected 101 items, got %d", len(sub))
+	}
+	for _, item := range sub {
+		if item.Path != "/folder" && !strings.HasPrefix(item.Path, "/folder/") {
+			t.Fatalf("unexpected item in /folder subtree: %s", item.Path)
+		}
+	}
+
+	// 2. ListSubtreeByStorage on /folder
+	subStorage, err := m.ListSubtreeByStorage(1, "/folder")
+	if err != nil {
+		t.Fatalf("ListSubtreeByStorage failed: %v", err)
+	}
+	if len(subStorage) != 101 {
+		t.Fatalf("expected 101 items for storage 1, got %d", len(subStorage))
+	}
+
+	// 3. DeleteSubtreeByStorageTx on /folder
+	err = m.WithTx(context.Background(), func(tx *sql.Tx) error {
+		return m.DeleteSubtreeByStorageTx(tx, 1, "/folder")
+	})
+	if err != nil {
+		t.Fatalf("DeleteSubtreeByStorageTx failed: %v", err)
+	}
+
+	// Sibling items must NOT be deleted
+	for _, p := range []string{"/folder.txt", "/folder-item", "/folder0", "/folder_other"} {
+		if _, err := m.GetFile(1, p); err != nil {
+			t.Fatalf("sibling item %s was wrongly deleted: %v", p, err)
+		}
+	}
+
+	// Storage quotas must only reflect siblings: 10 + 20 + 30 + 40 = 100 bytes, 4 files
+	st, err := m.GetStorage(1)
+	if err != nil {
+		t.Fatalf("GetStorage failed: %v", err)
+	}
+	if st.UsedBytes != 100 || st.FileCount != 4 {
+		t.Fatalf("expected used=100 count=4 after subtree deletion, got used=%d count=%d", st.UsedBytes, st.FileCount)
 	}
 }

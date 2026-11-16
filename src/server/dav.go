@@ -33,6 +33,7 @@ func (s *Server) resolveDAVPath(p string) string {
 	}
 	return clean
 }
+
 // resolveDestinationPath normalizes the Destination header path against srcPath.
 // If Destination was provided as an absolute URI via a reverse proxy (e.g. OpenList mounting at /dav/WebDavAggregation/)
 // while the inner request path has that mount prefix stripped, this strips the mount prefix from destPath as well.
@@ -114,6 +115,8 @@ func (s *Server) isExpired(rec data.FileRecord) bool {
 	return time.Since(rec.LastProbedAt) > d
 }
 
+const maxDeleteWorkers = 16
+
 func cleanNodeDirRecursive(ctx context.Context, n *cluster.Node, dirPath string) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -129,19 +132,80 @@ func cleanNodeDirRecursive(ctx context.Context, n *cluster.Node, dirPath string)
 		return err
 	}
 	normRoot := data.NormalizePath(dirPath)
+	var filePaths []string
+	var dirPaths []string
 	for _, info := range infos {
 		normItem := data.NormalizePath(info.Path)
 		if normItem == normRoot {
 			continue
 		}
 		if info.IsDir {
-			_ = cleanNodeDirRecursive(ctx, n, info.Path)
-			_ = n.Client.Delete(ctx, info.Path)
+			dirPaths = append(dirPaths, info.Path)
 		} else {
-			_ = n.Client.Delete(ctx, info.Path)
+			filePaths = append(filePaths, info.Path)
 		}
 	}
-	return n.Client.Delete(ctx, dirPath)
+
+	var wg sync.WaitGroup
+
+	if len(filePaths) > 0 {
+		fileWorkers := min(maxDeleteWorkers, len(filePaths))
+		fileCh := make(chan string, len(filePaths))
+		for _, fp := range filePaths {
+			fileCh <- fp
+		}
+		close(fileCh)
+
+		for range fileWorkers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for fp := range fileCh {
+					if ctx.Err() != nil {
+						return
+					}
+					if delErr := n.Client.Delete(ctx, fp); delErr != nil && !errors.Is(delErr, client.ErrNotFound) {
+						logger.Warn("DAV", "Clean leaf file %s on node %d failed: %v", fp, n.ID(), delErr)
+					}
+				}
+			}()
+		}
+	}
+
+	if len(dirPaths) > 0 {
+		dirWorkers := min(maxDeleteWorkers, len(dirPaths))
+		dirCh := make(chan string, len(dirPaths))
+		for _, dp := range dirPaths {
+			dirCh <- dp
+		}
+		close(dirCh)
+
+		for range dirWorkers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for dp := range dirCh {
+					if ctx.Err() != nil {
+						return
+					}
+					if cleanErr := cleanNodeDirRecursive(ctx, n, dp); cleanErr != nil && !errors.Is(cleanErr, client.ErrNotFound) {
+						logger.Warn("DAV", "Clean subdir %s on node %d failed: %v", dp, n.ID(), cleanErr)
+					}
+				}
+			}()
+		}
+	}
+
+	wg.Wait()
+
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	delErr := n.Client.Delete(ctx, dirPath)
+	if delErr != nil && errors.Is(delErr, client.ErrNotFound) {
+		return nil
+	}
+	return delErr
 }
 func (s *Server) handleOptions(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("DAV", "1, 2")
@@ -1033,11 +1097,13 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	for sid := range storageIDs {
 		node, ok := s.cluster.GetNode(sid)
 		if !ok || node == nil || node.Client == nil {
+			mu.Lock()
 			failures = append(failures, DeleteFailure{
 				Path:       davPath,
 				StatusCode: http.StatusBadGateway,
 				StatusText: fmt.Sprintf("storage node %d unavailable", sid),
 			})
+			mu.Unlock()
 			continue
 		}
 		delWG.Add(1)
@@ -1045,40 +1111,99 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 			defer delWG.Done()
 			ctx := r.Context()
 
-			// Step 1: Delete all leaf files on this node under davPath
-			files := nodeFiles[id]
-			for _, f := range files {
-				if ctx.Err() != nil {
-					break
-				}
-				if err := n.Client.Delete(ctx, f.Path); err != nil && !errors.Is(err, client.ErrNotFound) {
-					logger.Warn("DAV", "Delete leaf file %s on node %d failed: %v", f.Path, id, err)
-				}
+			// Fast direct delete attempt:
+			// RFC 4918 Section 9.6: DELETE on a collection MUST delete all members (Depth: infinity).
+			// If upstream supports recursive deletion natively, this completes in 1 RTT without per-item overhead.
+			directErr := n.Client.Delete(ctx, davPath)
+			if directErr == nil || errors.Is(directErr, client.ErrNotFound) {
+				mu.Lock()
+				successfulIDs[id] = true
+				mu.Unlock()
+				return
 			}
 
-			// Step 2: Delete subdirectories in bottom-up order (deepest depth first)
+			// Fallback: directory cascading bottom-up deletion across this node.
+			// Step 1: Concurrently delete leaf files under davPath via a Worker Pool
+			files := nodeFiles[id]
+			if len(files) > 0 {
+				numWorkers := min(maxDeleteWorkers, len(files))
+				fileCh := make(chan string, len(files))
+				for _, f := range files {
+					fileCh <- f.Path
+				}
+				close(fileCh)
+
+				var fileWG sync.WaitGroup
+				for range numWorkers {
+					fileWG.Add(1)
+					go func() {
+						defer fileWG.Done()
+						for fp := range fileCh {
+							if ctx.Err() != nil {
+								return
+							}
+							if err := n.Client.Delete(ctx, fp); err != nil && !errors.Is(err, client.ErrNotFound) {
+								logger.Warn("DAV", "Delete leaf file %s on node %d failed: %v", fp, id, err)
+							}
+						}
+					}()
+				}
+				fileWG.Wait()
+			}
+
+			// Step 2: Delete subdirectories in bottom-up hierarchical order (deepest depth first).
+			// Directories at the same tree depth are independent sibling branches and are deleted concurrently.
 			dirs := nodeDirs[id]
-			sort.Slice(dirs, func(i, j int) bool {
-				di := strings.Count(dirs[i].Path, "/")
-				dj := strings.Count(dirs[j].Path, "/")
-				if di != dj {
-					return di > dj
-				}
-				return len(dirs[i].Path) > len(dirs[j].Path)
-			})
-			for _, d := range dirs {
-				if ctx.Err() != nil {
-					break
-				}
-				if err := n.Client.Delete(ctx, d.Path); err != nil && !errors.Is(err, client.ErrNotFound) {
-					if cleanErr := cleanNodeDirRecursive(ctx, n, d.Path); cleanErr != nil {
-						logger.Warn("DAV", "Delete subdir %s on node %d failed: %v", d.Path, id, cleanErr)
+			if len(dirs) > 0 {
+				depthMap := make(map[int][]string)
+				var depths []int
+				for _, d := range dirs {
+					p := data.NormalizePath(d.Path)
+					depth := strings.Count(p, "/")
+					if _, exists := depthMap[depth]; !exists {
+						depths = append(depths, depth)
 					}
+					depthMap[depth] = append(depthMap[depth], p)
+				}
+				sort.Slice(depths, func(i, j int) bool {
+					return depths[i] > depths[j]
+				})
+
+				for _, depth := range depths {
+					if ctx.Err() != nil {
+						break
+					}
+					levelDirs := depthMap[depth]
+					numDirWorkers := min(maxDeleteWorkers, len(levelDirs))
+					dirCh := make(chan string, len(levelDirs))
+					for _, dp := range levelDirs {
+						dirCh <- dp
+					}
+					close(dirCh)
+
+					var dirWG sync.WaitGroup
+					for range numDirWorkers {
+						dirWG.Add(1)
+						go func() {
+							defer dirWG.Done()
+							for dp := range dirCh {
+								if ctx.Err() != nil {
+									return
+								}
+								if err := n.Client.Delete(ctx, dp); err != nil && !errors.Is(err, client.ErrNotFound) {
+									if cleanErr := cleanNodeDirRecursive(ctx, n, dp); cleanErr != nil {
+										logger.Warn("DAV", "Delete subdir %s on node %d failed: %v", dp, id, cleanErr)
+									}
+								}
+							}
+						}()
+					}
+					dirWG.Wait()
 				}
 			}
 
 			// Step 3: Delete root target collection itself on this node.
-			// Cloud drivers (such as 189) fail or hang on non-empty directories.
+			// Cloud drivers (such as 189) fail on non-empty directories.
 			// If deleting the directory directly fails, fall back to recursive bottom-up physical cleanup.
 			err := n.Client.Delete(ctx, davPath)
 			if err != nil && !errors.Is(err, client.ErrNotFound) {

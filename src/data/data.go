@@ -34,11 +34,11 @@ type StorageRecord struct {
 
 // FileRecord represents a file or directory entry in SQLite files table.
 type FileRecord struct {
-	StorageID  int       `json:"storage_id" yaml:"storage_id"`
-	Path       string    `json:"path" yaml:"path"`
-	ParentPath string    `json:"parent_path,omitempty" yaml:"parent_path,omitempty"`
-	Size       int64     `json:"size" yaml:"size"`
-	IsDir      bool      `json:"is_dir" yaml:"is_dir"`
+	StorageID    int       `json:"storage_id" yaml:"storage_id"`
+	Path         string    `json:"path" yaml:"path"`
+	ParentPath   string    `json:"parent_path,omitempty" yaml:"parent_path,omitempty"`
+	Size         int64     `json:"size" yaml:"size"`
+	IsDir        bool      `json:"is_dir" yaml:"is_dir"`
 	ModTime      time.Time `json:"mod_time" yaml:"mod_time"`
 	LastProbedAt time.Time `json:"last_probed_at" yaml:"last_probed_at"`
 }
@@ -187,17 +187,21 @@ END;
 CREATE TRIGGER IF NOT EXISTS trg_files_delete_dir
 AFTER DELETE ON files
 FOR EACH ROW
-WHEN OLD.is_dir = 1
+WHEN OLD.is_dir = 1 AND OLD.path != '/'
 BEGIN
     DELETE FROM files
     WHERE storage_id = OLD.storage_id
-      AND (
-          CASE WHEN OLD.path = '/' THEN
-              path != '/'
-          ELSE
-              SUBSTR(path, 1, LENGTH(OLD.path) + 1) = OLD.path || '/'
-          END
-      );
+      AND path >= OLD.path || '/' AND path < OLD.path || '0';
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_files_delete_root_dir
+AFTER DELETE ON files
+FOR EACH ROW
+WHEN OLD.is_dir = 1 AND OLD.path = '/'
+BEGIN
+    DELETE FROM files
+    WHERE storage_id = OLD.storage_id
+      AND path > '/';
 END;
 `
 
@@ -338,6 +342,9 @@ func NewManager(filePath string) (*Manager, error) {
 			return nil, fmt.Errorf("execute %s: %w", p, err)
 		}
 	}
+
+	_, _ = db.Exec("DROP TRIGGER IF EXISTS trg_files_delete_dir;")
+	_, _ = db.Exec("DROP TRIGGER IF EXISTS trg_files_delete_root_dir;")
 
 	if _, err := db.Exec(schemaDDL); err != nil {
 		_ = db.Close()
@@ -729,7 +736,7 @@ func (m *Manager) ListSubtree(rootPath string) ([]FileRecord, error) {
 		rows, err = m.db.Query(`
 			SELECT storage_id, path, parent_path, size, is_dir, mod_time, last_probed_at
 			FROM files
-			WHERE path = ? OR SUBSTR(path, 1, LENGTH(?) + 1) = ? || '/'
+			WHERE path = ? OR (path >= ? || '/' AND path < ? || '0')
 			ORDER BY path ASC, storage_id ASC;
 		`, norm, norm, norm)
 	}
@@ -758,9 +765,9 @@ func (m *Manager) ListSubtreeByStorage(storageID int, rootPath string) ([]FileRe
 		rows, err = m.db.Query(`
 			SELECT storage_id, path, parent_path, size, is_dir, mod_time, last_probed_at
 			FROM files
-			WHERE storage_id = ? AND (path = ? OR SUBSTR(path, 1, LENGTH(?) + 1) = ? || '/')
+			WHERE (storage_id = ? AND path = ?) OR (storage_id = ? AND path >= ? || '/' AND path < ? || '0')
 			ORDER BY path ASC;
-		`, storageID, norm, norm, norm)
+		`, storageID, norm, storageID, norm, norm)
 	}
 	if err != nil {
 		return nil, fmt.Errorf("list subtree %d:%s: %w", storageID, norm, err)
@@ -782,7 +789,7 @@ func (m *Manager) DeleteSubtree(rootPath string) error {
 
 		_, err := tx.Exec(`
 			DELETE FROM files
-			WHERE path = ? OR SUBSTR(path, 1, LENGTH(?) + 1) = ? || '/';
+			WHERE path = ? OR (path >= ? || '/' AND path < ? || '0');
 		`, norm, norm, norm)
 		return err
 	})
@@ -799,8 +806,8 @@ func (m *Manager) DeleteSubtreeByStorageTx(tx *sql.Tx, storageID int, rootPath s
 
 	_, err := tx.Exec(`
 		DELETE FROM files
-		WHERE storage_id = ? AND (path = ? OR SUBSTR(path, 1, LENGTH(?) + 1) = ? || '/');
-	`, storageID, norm, norm, norm)
+		WHERE (storage_id = ? AND path = ?) OR (storage_id = ? AND path >= ? || '/' AND path < ? || '0');
+	`, storageID, norm, storageID, norm, norm)
 	return err
 }
 
@@ -1217,7 +1224,7 @@ func (m *Manager) MovePathTx(tx *sql.Tx, storageID int, oldPath, newPath string)
 			SET path = ? || SUBSTR(path, LENGTH(?) + 1),
 			    parent_path = ? || SUBSTR(parent_path, LENGTH(?) + 1),
 			    mod_time = CURRENT_TIMESTAMP
-			WHERE storage_id = ? AND SUBSTR(path, 1, LENGTH(?) + 1) = ? || '/';
+			WHERE storage_id = ? AND path >= ? || '/' AND path < ? || '0';
 		`, newNorm, oldNorm, newNorm, oldNorm, storageID, oldNorm, oldNorm)
 		if err != nil {
 			return fmt.Errorf("move descendants of %s -> %s: %w", oldNorm, newNorm, err)
